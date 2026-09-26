@@ -1,16 +1,36 @@
 // IndexedDB 轻封装（离线优先；无 IndexedDB 环境自动降级为内存存储）
+// 写操作返回是否真正落库，并提供 count() 供写入后核对条数
 const DB_NAME = 'app-024-lantern-riddle';
 const DB_VERSION = 1;
 export const STORE_RIDDLES = 'riddles';
 export const STORE_RECORDS = 'records';
 export const STORE_KV = 'kv';
 
+export type BackendMode = 'idb' | 'memory';
+
 let dbPromise: Promise<IDBDatabase | null> | null = null;
+let backendMode: BackendMode = typeof indexedDB === 'undefined' ? 'memory' : 'idb';
+let lastWriteError: string | null = null;
+
+/** 当前实际使用的存储后端：idb=可持久化；memory=刷新/关闭页面即丢 */
+export function backend(): BackendMode {
+  return backendMode;
+}
+
+/** 最近一次持久化写入的失败信息（写入成功时清除） */
+export function lastError(): string | null {
+  return lastWriteError;
+}
+
+function noteWrite(ok: boolean, what: string): boolean {
+  lastWriteError = ok ? null : `${what}未能写入本机数据库`;
+  return ok;
+}
 
 function openDB(): Promise<IDBDatabase | null> {
   if (dbPromise) return dbPromise;
   dbPromise = new Promise((resolve) => {
-    if (typeof indexedDB === 'undefined') { resolve(null); return; }
+    if (typeof indexedDB === 'undefined') { backendMode = 'memory'; resolve(null); return; }
     const req = indexedDB.open(DB_NAME, DB_VERSION);
     req.onupgradeneeded = () => {
       const db = req.result;
@@ -24,9 +44,9 @@ function openDB(): Promise<IDBDatabase | null> {
       }
       if (!db.objectStoreNames.contains(STORE_KV)) db.createObjectStore(STORE_KV, { keyPath: 'key' });
     };
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => resolve(null);
-    req.onblocked = () => resolve(null);
+    req.onsuccess = () => { backendMode = 'idb'; resolve(req.result); };
+    req.onerror = () => { backendMode = 'memory'; resolve(null); };
+    req.onblocked = () => { backendMode = 'memory'; resolve(null); };
   });
   return dbPromise;
 }
@@ -58,38 +78,83 @@ export async function getAll<T>(store: string): Promise<T[]> {
   return [...memStore(store).values()] as T[];
 }
 
-export async function put<T extends { id?: string; key?: string }>(store: string, value: T): Promise<void> {
-  const { ok } = await tx(store, 'readwrite', (s) => s.put(value));
-  if (!ok) memStore(store).set((value.id ?? value.key) as string, value);
+/** 实际落库条数（供写入后核对）；内存模式返回 null */
+export async function count(store: string): Promise<number | null> {
+  const db = await openDB();
+  if (!db) return null;
+  const { ok, result } = await tx<number>(store, 'readonly', (s) => s.count());
+  return ok ? result : null;
 }
 
-export async function putMany<T extends { id?: string; key?: string }>(store: string, values: T[]): Promise<void> {
+export async function put<T extends { id?: string; key?: string }>(store: string, value: T): Promise<boolean> {
+  const db = await openDB();
+  if (!db) { memStore(store).set((value.id ?? value.key) as string, value); return true; }
+  const { ok } = await tx(store, 'readwrite', (s) => s.put(value));
+  if (!ok) memStore(store).set((value.id ?? value.key) as string, value);
+  return noteWrite(ok, '数据');
+}
+
+export async function putMany<T extends { id?: string; key?: string }>(store: string, values: T[]): Promise<boolean> {
   const db = await openDB();
   if (!db) {
     const m = memStore(store);
     for (const v of values) m.set((v.id ?? v.key) as string, v);
-    return;
+    return true;
   }
-  await new Promise<void>((resolve) => {
+  const ok = await new Promise<boolean>((resolve) => {
     try {
       const t = db.transaction(store, 'readwrite');
       const os = t.objectStore(store);
       for (const v of values) os.put(v);
-      t.oncomplete = () => resolve();
-      t.onerror = () => resolve();
-      t.onabort = () => resolve();
-    } catch { resolve(); }
+      t.oncomplete = () => resolve(true);
+      t.onerror = () => resolve(false);
+      t.onabort = () => resolve(false);
+    } catch { resolve(false); }
   });
+  if (!ok) {
+    const m = memStore(store);
+    for (const v of values) m.set((v.id ?? v.key) as string, v);
+  }
+  return noteWrite(ok, '批量数据');
 }
 
-export async function del(store: string, key: string): Promise<void> {
+export async function del(store: string, key: string): Promise<boolean> {
+  const db = await openDB();
+  if (!db) { memStore(store).delete(key); return true; }
   const { ok } = await tx(store, 'readwrite', (s) => s.delete(key));
   if (!ok) memStore(store).delete(key);
+  return noteWrite(ok, '删除操作');
 }
 
-export async function clearStore(store: string): Promise<void> {
+export async function clearStore(store: string): Promise<boolean> {
+  const db = await openDB();
+  if (!db) { memStore(store).clear(); return true; }
   const { ok } = await tx(store, 'readwrite', (s) => s.clear());
   if (!ok) memStore(store).clear();
+  return noteWrite(ok, '清空操作');
+}
+
+/** 整表替换（单事务 clear + 批量 put），备份导入/回滚用；失败返回 false */
+export async function replaceAll<T extends { id?: string; key?: string }>(store: string, values: T[]): Promise<boolean> {
+  const db = await openDB();
+  if (!db) {
+    const m = memStore(store);
+    m.clear();
+    for (const v of values) m.set((v.id ?? v.key) as string, v);
+    return true;
+  }
+  const ok = await new Promise<boolean>((resolve) => {
+    try {
+      const t = db.transaction(store, 'readwrite');
+      const os = t.objectStore(store);
+      os.clear();
+      for (const v of values) os.put(v);
+      t.oncomplete = () => resolve(true);
+      t.onerror = () => resolve(false);
+      t.onabort = () => resolve(false);
+    } catch { resolve(false); }
+  });
+  return noteWrite(ok, '整表替换');
 }
 
 export async function getKV<T>(key: string): Promise<T | null> {
@@ -99,6 +164,6 @@ export async function getKV<T>(key: string): Promise<T | null> {
   return v?.value ?? null;
 }
 
-export async function setKV<T>(key: string, value: T): Promise<void> {
-  await put(STORE_KV, { key, value });
+export async function setKV<T>(key: string, value: T): Promise<boolean> {
+  return put(STORE_KV, { key, value });
 }

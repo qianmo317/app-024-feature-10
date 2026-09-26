@@ -3,7 +3,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { useAppState } from '../ui/router';
 import { CATEGORY_LABEL, FORMAT_LABEL } from '../types';
 import { formatDateTime } from '../lib/format';
-import { store } from '../lib/store';
+import { downloadFullBackup, store } from '../lib/store';
 
 const QUICK_PRIZE_IDX = 0; // 长按快速登记使用第一个奖项
 
@@ -21,6 +21,7 @@ export function Onsite() {
   const inputRef = useRef<HTMLInputElement>(null);
 
   const stats = store.stats();
+  const needBackup = store.needsBackup();
   const byNo = useMemo(() => new Map(state.riddles.map((r) => [r.no, r])), [state.riddles]);
   const recordsOfCurrent = current != null
     ? state.records.filter((r) => r.riddleId === byNo.get(current)?.id)
@@ -45,6 +46,10 @@ export function Onsite() {
 
   const register = async (quick = false) => {
     if (!currentRiddle) return;
+    if (store.needsBackup()) {
+      setMsg({ kind: 'bad', text: '存储异常：数据可能没有真正存住，请先在上方导出整包备份，再继续登记' });
+      return;
+    }
     if (state.records.some((x) => x.riddleId === currentRiddle.id)) {
       setMsg({ kind: 'warn', text: `谜号 ${currentRiddle.no} 已登记过，请勿重复登记（如需修改请在下方列表删除后重登）` });
       return;
@@ -104,6 +109,19 @@ export function Onsite() {
         <div className="stat"><b>{stats.prizes}</b><span>奖品发放</span></div>
       </div>
 
+      {needBackup && (
+        <div className="panel panel-alert" role="alert">
+          <h3>⚠ 登记前请先导出备份</h3>
+          <p className="bad-text">
+            {state.persist.mode === 'memory'
+              ? '当前环境无法持久保存数据（仅内存），刷新或关闭页面后谜库与登记将全部丢失。'
+              : `数据写入核对异常：${state.persist.detail ?? '实际存下的条数与预期不符'}。`}
+            为避免劳动成果丢失，请先导出整包备份，再继续登记。
+          </p>
+          <button className="btn btn-primary" onClick={() => downloadFullBackup()}>⬇ 立即导出整包备份</button>
+        </div>
+      )}
+
       <div className="onsite-grid">
         <div className="panel">
           <h3>按谜号登记</h3>
@@ -155,15 +173,16 @@ export function Onsite() {
                 <div className="btn-row">
                   <button
                     className="btn btn-primary btn-lg"
-                    disabled={recordsOfCurrent.length > 0}
+                    disabled={needBackup || recordsOfCurrent.length > 0}
+                    title={needBackup ? '存储异常：请先在上方导出整包备份' : undefined}
                     onClick={() => register(false)}
                   >
                     ✓ 登记猜中
                   </button>
                   <button
                     className="btn btn-lg"
-                    disabled={recordsOfCurrent.length > 0}
-                    title="长按 0.6 秒快速登记（第一个奖项）"
+                    disabled={needBackup || recordsOfCurrent.length > 0}
+                    title={needBackup ? '存储异常：请先在上方导出整包备份' : '长按 0.6 秒快速登记（第一个奖项）'}
                     onPointerDown={pressStart}
                     onPointerUp={pressCancel}
                     onPointerLeave={pressCancel}

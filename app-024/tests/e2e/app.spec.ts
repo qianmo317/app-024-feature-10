@@ -164,6 +164,54 @@ test.describe('元宵灯谜库 E2E', () => {
     expect(buf.toString('utf8')).toContain('谜号,谜面,谜底,猜中者');
   });
 
+  test('导出整包备份 JSON（含导出时间/条数/来源）', async ({ page }) => {
+    await importSample(page);
+    await page.click('nav >> text=设置');
+    const [download] = await Promise.all([
+      page.waitForEvent('download'),
+      page.click('button:has-text("导出整包备份")'),
+    ]);
+    const buf = readFileSync((await download.path())!, 'utf8');
+    const data = JSON.parse(buf);
+    expect(data.kind).toBe('lantern-riddle-backup');
+    expect(data.exportedAt).toBeGreaterThan(0);
+    expect(data.counts).toEqual({ riddles: TOTAL, records: 0 });
+    expect(data.source).toContain('元宵灯会');
+    expect(data.riddles).toHaveLength(TOTAL);
+    expect(data.settings.prizes.length).toBeGreaterThan(0);
+  });
+
+  test('导入备份：预览 → 确认 → 恢复（含登记记录）', async ({ page }) => {
+    await importSample(page);
+    // 登记 1 条后导出整包备份
+    await page.click('nav >> text=现场登记');
+    await page.fill('.onsite-no', '1');
+    await page.click('button:has-text("查找")');
+    await page.click('button:has-text("✓ 登记猜中")');
+    await expect(page.locator('.stat-ok')).toContainText('1');
+    await page.click('nav >> text=设置');
+    const [download] = await Promise.all([
+      page.waitForEvent('download'),
+      page.click('button:has-text("导出整包备份")'),
+    ]);
+    const backupPath = (await download.path())!;
+    // 清空谜库后从备份恢复
+    page.once('dialog', (d) => d.accept());
+    await page.click('button:has-text("清空谜库")');
+    await expect(page.locator('.notice')).toContainText('谜库已清空');
+    await page.setInputFiles('input[accept*="json"]', backupPath);
+    await expect(page.locator('.panel-import')).toContainText('备份恢复预览');
+    await expect(page.locator('.panel-import')).toContainText(`新增 ${TOTAL} 条`);
+    await expect(page.locator('.panel-import')).toContainText('覆盖 1 条'); // 登记记录覆盖
+    await page.click('button:has-text("确认恢复")');
+    await expect(page.locator('.notice')).toContainText('恢复完成');
+    // 谜库与登记都回来了
+    await page.click('nav >> text=谜库');
+    await expect(page.locator('.page-head h1')).toContainText(`${TOTAL} 条`);
+    await page.click('nav >> text=现场登记');
+    await expect(page.locator('.stat-ok')).toContainText('1');
+  });
+
   test('哈希深链直达', async ({ page }) => {
     await page.goto('/#/library');
     await expect(page.locator('.lib-grid')).toBeVisible();

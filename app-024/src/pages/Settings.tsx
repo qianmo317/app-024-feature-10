@@ -1,9 +1,10 @@
-// 设置：活动信息 / 打印默认 / 奖品预设 / 导入导出 / 清空
-import { useState } from 'react';
+// 设置：活动信息 / 打印默认 / 奖品预设 / 整包备份恢复 / 导入导出 / 清空
+import { useRef, useState } from 'react';
 import { useAppState } from '../ui/router';
 import { riddleToRow, stringifyCSV, withBOM, RIDDLE_CSV_HEADERS } from '../lib/csv';
-import { downloadText } from '../lib/format';
-import { exportFileName, store } from '../lib/store';
+import { downloadText, formatDateTime } from '../lib/format';
+import { DEFAULT_SETTINGS, downloadFullBackup, exportFileName, store } from '../lib/store';
+import { parseBackup, previewBackup, type BackupData, type BackupPreview } from '../lib/backup';
 
 export function Settings() {
   const state = useAppState();
@@ -12,6 +13,8 @@ export function Settings() {
   const [pr, setPr] = useState(print);
   const [newPrize, setNewPrize] = useState('');
   const [notice, setNotice] = useState('');
+  const [backupPrev, setBackupPrev] = useState<{ data: BackupData; preview: BackupPreview } | null>(null);
+  const backupFileRef = useRef<HTMLInputElement>(null);
 
   const saveEvent = () => void store.saveSettings({ event: { ...ev, riddleIds: event.riddleIds } }).then(() => setNotice('活动信息已保存'));
   const savePrint = () => void store.saveSettings({ print: pr }).then(() => setNotice('打印默认已保存'));
@@ -39,6 +42,39 @@ export function Settings() {
     downloadText(exportFileName('现场登记', 'csv'), withBOM(csv));
   };
 
+  const exportBackup = () => {
+    downloadFullBackup();
+    setNotice(`已导出整包备份（谜库 ${state.riddles.length} 条 · 登记 ${state.records.length} 条 · 设置），请妥善留存`);
+  };
+
+  const onBackupFile = async (file: File | undefined) => {
+    if (!file) return;
+    const text = await file.text();
+    const parsed = parseBackup(text);
+    if (!parsed.ok) {
+      setNotice(`备份文件无法读取：${parsed.error}`);
+    } else {
+      setBackupPrev({ data: parsed.data, preview: previewBackup(parsed.data, state, DEFAULT_SETTINGS) });
+    }
+    if (backupFileRef.current) backupFileRef.current.value = '';
+  };
+
+  const confirmBackupImport = async () => {
+    if (!backupPrev) return;
+    try {
+      const r = await store.importBackup(backupPrev.data);
+      setNotice(
+        `恢复完成：谜库新增 ${r.riddlesAdded} 条、覆盖 ${r.riddlesOverwritten} 条` +
+        `${r.renumbered ? `、谜号冲突重新编号 ${r.renumbered} 条` : ''}；` +
+        `登记新增 ${r.recordsAdded} 条、覆盖 ${r.recordsOverwritten} 条` +
+        (r.settingsApplied ? '；设置已覆盖' : '；设置保持不变'),
+      );
+    } catch (e) {
+      setNotice(`导入失败：${e instanceof Error ? e.message : String(e)}`);
+    }
+    setBackupPrev(null);
+  };
+
   const clearRecords = async () => {
     if (!confirm(`确定清空全部 ${state.records.length} 条登记记录？此操作不可恢复。`)) return;
     await store.clearRecords();
@@ -54,6 +90,35 @@ export function Settings() {
     <div>
       <div className="page-head"><h1>设置</h1></div>
       {notice && <div className="notice">{notice}<button className="notice-x" onClick={() => setNotice('')} aria-label="关闭">×</button></div>}
+
+      {backupPrev && (
+        <div className="panel panel-import">
+          <h3>备份恢复预览（确认后才写库）</h3>
+          <p className="muted">
+            导出时间：<b>{backupPrev.preview.exportedAt ? formatDateTime(backupPrev.preview.exportedAt) : '未知'}</b> ·
+            来源：<b>{backupPrev.preview.source}</b> ·
+            文件内含：谜库 {backupPrev.preview.fileCounts.riddles} 条、登记 {backupPrev.preview.fileCounts.records} 条
+            {backupPrev.preview.hasSettings ? '、设置' : ''}
+          </p>
+          <p>
+            谜库：<b className="ok-text">新增 {backupPrev.preview.riddlesAdded} 条</b> ·
+            <b className="warn-text"> 覆盖 {backupPrev.preview.riddlesOverwritten} 条</b>
+            {backupPrev.preview.renumbered > 0 && <b className="warn-text"> · 谜号冲突将重新编号 {backupPrev.preview.renumbered} 条</b>}
+            <br />
+            登记：<b className="ok-text">新增 {backupPrev.preview.recordsAdded} 条</b> ·
+            <b className="warn-text"> 覆盖 {backupPrev.preview.recordsOverwritten} 条</b>
+            <br />
+            设置：{backupPrev.preview.hasSettings
+              ? <b className="warn-text">将覆盖当前活动信息、打印默认与奖品预设</b>
+              : <span className="muted">文件不含设置，保留当前设置</span>}
+          </p>
+          <p className="muted small">确认后整包写入并核对条数；中途失败会自动回滚到导入前状态。</p>
+          <div className="btn-row">
+            <button className="btn btn-primary" onClick={() => void confirmBackupImport()}>确认恢复</button>
+            <button className="btn btn-ghost" onClick={() => setBackupPrev(null)}>取消</button>
+          </div>
+        </div>
+      )}
 
       <div className="settings-grid">
         <div className="panel">
@@ -109,6 +174,26 @@ export function Settings() {
         </div>
 
         <div className="panel">
+          <h3>整包备份与恢复</h3>
+          <p className="muted small">
+            把谜库、登记记录和设置打包成一个 JSON 文件（写明导出时间、条数与来源）。
+            换电脑、清理浏览器或活动现场交班前，请先导出备份；恢复时会先预览再确认。
+          </p>
+          <div className="btn-row wrap">
+            <button className="btn btn-primary" onClick={exportBackup}>⬇ 导出整包备份（JSON）</button>
+            <button className="btn" onClick={() => backupFileRef.current?.click()}>⬆ 导入备份…</button>
+            <input ref={backupFileRef} type="file" accept=".json,application/json" hidden onChange={(e) => void onBackupFile(e.target.files?.[0])} />
+          </div>
+          {state.persist.mode !== 'persistent' && (
+            <p className="bad-text small">
+              ⚠ {state.persist.mode === 'memory'
+                ? '当前为内存模式，数据不会被持久保存，请立即导出备份。'
+                : `存储异常：${state.persist.detail ?? ''}，请立即导出备份。`}
+            </p>
+          )}
+        </div>
+
+        <div className="panel">
           <h3>数据管理</h3>
           <div className="btn-row wrap">
             <button className="btn" onClick={() => void store.recheckAll().then(() => setNotice('已重新校验全部谜格'))}>🔄 重新校验全部谜格</button>
@@ -119,7 +204,7 @@ export function Settings() {
             <button className="btn btn-danger" onClick={() => void clearRecords()}>清空现场登记（{state.records.length}）</button>
             <button className="btn btn-danger" onClick={() => void clearRiddles()}>清空谜库（{state.riddles.length}）</button>
           </div>
-          <p className="muted small">谜库 CSV 导入在「谜库」页右上角；示例文件见 <a href={`${import.meta.env.BASE_URL}samples/riddles.csv`} download>riddles.csv</a>。全部数据保存在本机 IndexedDB，导出文件请自行留存。</p>
+          <p className="muted small">谜库 CSV 导入在「谜库」页右上角；示例文件见 <a href={`${import.meta.env.BASE_URL}samples/riddles.csv`} download>riddles.csv</a>。全部数据保存在本机 IndexedDB，清空前建议先导出整包备份。</p>
         </div>
       </div>
     </div>
