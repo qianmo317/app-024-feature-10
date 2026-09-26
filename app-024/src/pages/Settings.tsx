@@ -1,9 +1,10 @@
-// 设置：活动信息 / 打印默认 / 奖品预设 / 导入导出 / 清空
-import { useState } from 'react';
+// 设置：活动信息 / 打印默认 / 奖品预设 / 整包备份与恢复 / 清空
+import { useRef, useState } from 'react';
 import { useAppState } from '../ui/router';
 import { riddleToRow, stringifyCSV, withBOM, RIDDLE_CSV_HEADERS } from '../lib/csv';
-import { downloadText } from '../lib/format';
-import { exportFileName, store } from '../lib/store';
+import { downloadText, formatDateTime } from '../lib/format';
+import { downloadBackup, exportFileName, store } from '../lib/store';
+import { parseBackup, planImport, type ImportPlan } from '../lib/backup';
 
 export function Settings() {
   const state = useAppState();
@@ -12,6 +13,10 @@ export function Settings() {
   const [pr, setPr] = useState(print);
   const [newPrize, setNewPrize] = useState('');
   const [notice, setNotice] = useState('');
+  const [plan, setPlan] = useState<ImportPlan | null>(null);
+  const [importError, setImportError] = useState('');
+  const [importing, setImporting] = useState(false);
+  const backupFileRef = useRef<HTMLInputElement>(null);
 
   const saveEvent = () => void store.saveSettings({ event: { ...ev, riddleIds: event.riddleIds } }).then(() => setNotice('活动信息已保存'));
   const savePrint = () => void store.saveSettings({ print: pr }).then(() => setNotice('打印默认已保存'));
@@ -39,6 +44,31 @@ export function Settings() {
     downloadText(exportFileName('现场登记', 'csv'), withBOM(csv));
   };
 
+  const onBackupFile = async (file: File | undefined) => {
+    if (!file) return;
+    setImportError('');
+    setPlan(null);
+    const parsed = parseBackup(await file.text());
+    if (backupFileRef.current) backupFileRef.current.value = '';
+    if (!parsed.ok) { setImportError(parsed.error); return; }
+    setPlan(planImport(parsed.backup, state.riddles, state.records));
+  };
+
+  const confirmRestore = async () => {
+    if (!plan || importing) return;
+    setImporting(true);
+    const res = await store.applyBackup(plan);
+    setImporting(false);
+    if (!res.ok) {
+      setImportError(res.error ?? '导入失败，已回到导入前状态');
+      setPlan(null);
+      return;
+    }
+    setNotice(`整包恢复完成：新增谜条 ${plan.freshRiddles.length} 条、覆盖 ${plan.overwriteRiddles.length} 条；`
+      + `新增登记 ${plan.freshRecords.length} 条、覆盖 ${plan.overwriteRecords.length} 条；设置已替换`);
+    setPlan(null);
+  };
+
   const clearRecords = async () => {
     if (!confirm(`确定清空全部 ${state.records.length} 条登记记录？此操作不可恢复。`)) return;
     await store.clearRecords();
@@ -49,6 +79,8 @@ export function Settings() {
     await store.clearRiddles();
     setNotice('谜库已清空');
   };
+
+  const issue = state.persistIssue;
 
   return (
     <div>
@@ -106,6 +138,63 @@ export function Settings() {
             ))}
             {!prizes.length && <li className="muted">暂无奖项（现场登记时奖项下拉为空）</li>}
           </ul>
+        </div>
+
+        <div className="panel">
+          <h3>存储状态</h3>
+          {state.storageMode === 'mem' ? (
+            <p className="bad-text">⚠ 内存模式：本机数据库不可用，数据只保存在内存中，<b>刷新或关闭页面后全部丢失</b>。请尽快导出整包备份。</p>
+          ) : issue ? (
+            <p className="bad-text">⚠ {issue.message}</p>
+          ) : (
+            <p className="ok-text">✓ 本机数据库（IndexedDB）正常，谜库 {state.riddles.length} 条、登记 {state.records.length} 条均已落库核对。</p>
+          )}
+          {issue?.kind === 'mismatch' && issue.expected && issue.actual && (
+            <p className="muted small">
+              最近核对 {formatDateTime(issue.at)}：谜库应存 {issue.expected.riddles} / 实存 {issue.actual.riddles}，
+              登记应存 {issue.expected.records} / 实存 {issue.actual.records}
+            </p>
+          )}
+        </div>
+
+        <div className="panel">
+          <h3>整包备份 / 恢复</h3>
+          <p className="muted small">把谜库、登记记录和设置导出为一个 JSON 文件（含导出时间、条数与来源）；恢复时先预览新增与覆盖，确认后才写库，失败自动回到导入前状态。</p>
+          <div className="btn-row wrap">
+            <button className="btn btn-primary" onClick={downloadBackup}>⬇ 导出整包备份（{state.riddles.length} 谜 + {state.records.length} 登记 + 设置）</button>
+            <button className="btn" onClick={() => { setImportError(''); backupFileRef.current?.click(); }}>⬆ 导入整包备份…</button>
+            <input ref={backupFileRef} type="file" accept=".json,application/json" hidden onChange={(e) => void onBackupFile(e.target.files?.[0])} />
+          </div>
+          {importError && <p className="msg msg-bad">{importError}</p>}
+          {plan && (
+            <div className="panel panel-import restore-preview">
+              <h4>恢复预览 — 确认后才写库</h4>
+              <p className="muted small">
+                文件导出时间：{plan.backup.exportedAt ? formatDateTime(Date.parse(plan.backup.exportedAt)) : '未知'}
+                {plan.backup.source.event && <> · 来源活动：{plan.backup.source.event}</>}
+                {plan.backup.source.host && <>（{plan.backup.source.host}）</>}
+                <> · 文件记录：谜 {plan.backup.counts.riddles} 条 / 登记 {plan.backup.counts.records} 条</>
+              </p>
+              <ul className="check-list">
+                <li>谜条：<b className="ok-text">新增 {plan.freshRiddles.length} 条</b>，<b className="warn-text">覆盖 {plan.overwriteRiddles.length} 条</b>
+                  {plan.renumbered > 0 && <span className="warn-text">（{plan.renumbered} 条谜号冲突，将自动重新编号）</span>}
+                </li>
+                <li>登记记录：<b className="ok-text">新增 {plan.freshRecords.length} 条</b>，<b className="warn-text">覆盖 {plan.overwriteRecords.length} 条</b>
+                  {plan.orphanRecords > 0 && <span className="muted">（{plan.orphanRecords} 条登记对应的谜条不存在，保留但显示为「?」）</span>}
+                </li>
+                <li>设置：<b className="warn-text">整体替换</b>（活动信息、打印默认、奖品预设）</li>
+                {(plan.backup.dataInvalidSkipped ?? 0) > 0 && (
+                  <li className="bad-text">文件中有 {plan.backup.dataInvalidSkipped} 条数据无效，已跳过</li>
+                )}
+              </ul>
+              <div className="btn-row">
+                <button className="btn btn-primary" disabled={importing} onClick={() => void confirmRestore()}>
+                  {importing ? '正在写库…' : '确认恢复'}
+                </button>
+                <button className="btn btn-ghost" disabled={importing} onClick={() => setPlan(null)}>取消</button>
+              </div>
+            </div>
+          )}
         </div>
 
         <div className="panel">

@@ -58,7 +58,26 @@ h4 { margin: 12px 0 6px; font-size: 14px; }
 }
 .badge-offline { background: #fff3cd; color: #7a5b00; border-color: #e8cf8a; font-weight: 600; }
 .badge-warn { background: #fdeaea; color: var(--bad); border-color: #f2c4c4; }
+.badge-danger { background: #c02626; color: #fff; border-color: #8f1b25; font-weight: 700; }
 .badge-solved { background: #e5f3e8; color: var(--ok); border-color: #c4e2cc; }
+
+/* ---- 醒目告警横幅（内存降级 / 存储核对不符 / 校验数据缺失）---- */
+.alert-banner {
+  display: flex; align-items: center; gap: 14px;
+  border-radius: 10px; padding: 12px 16px; margin-bottom: 14px;
+  border: 2px solid;
+}
+.alert-danger { background: #fde7e7; border-color: var(--bad); color: #7c1212; }
+.alert-warn { background: #fff8e1; border-color: var(--warn); color: #6b4a00; }
+.alert-icon { font-size: 30px; line-height: 1; flex: 0 0 auto; }
+.alert-body { flex: 1; min-width: 0; }
+.alert-body b { font-size: 15px; }
+.alert-body p { margin: 3px 0 0; font-size: 13.5px; }
+.alert-actions { display: flex; gap: 8px; flex-shrink: 0; flex-wrap: wrap; }
+@media (max-width: 720px) {
+  .alert-banner { flex-direction: column; align-items: stretch; }
+  .alert-actions { justify-content: stretch; }
+}
 
 /* ---- 布局 ---- */
 .container { max-width: 1080px; margin: 0 auto; padding: 18px 16px 60px; }

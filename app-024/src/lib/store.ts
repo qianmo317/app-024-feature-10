@@ -3,7 +3,8 @@ import type { AppSettings, OnsiteRecord, Riddle } from '../types';
 import { validateRiddle } from './validate';
 import { EMPTY_CTX, loadDataCtx, type DataCtx } from './datafiles';
 import * as idb from './idb';
-import { formatDate } from './format';
+import { formatDate, downloadText } from './format';
+import { buildBackup, mergeRiddles, mergeRecords, mergeSettings, type ImportPlan } from './backup';
 
 const KV_SETTINGS = 'settings';
 
@@ -17,6 +18,15 @@ export const DEFAULT_SETTINGS: AppSettings = {
   prizes: ['参与奖', '三等奖', '二等奖', '一等奖'],
 };
 
+/** 持久化核对结果：内存降级 / 写入条数对不上 时给出醒目提示 */
+export interface PersistIssue {
+  kind: 'memory' | 'mismatch';
+  message: string;
+  expected?: { riddles: number; records: number };
+  actual?: { riddles: number; records: number };
+  at: number;
+}
+
 export interface AppState {
   ready: boolean;
   riddles: Riddle[];
@@ -24,6 +34,8 @@ export interface AppState {
   settings: AppSettings;
   ctx: DataCtx; // 拼音/部件离线数据
   selected: Set<string>; // 批量出条选中（会话级，不持久化）
+  storageMode: 'idb' | 'mem'; // 本机数据库可用性（mem = 刷新即丢失）
+  persistIssue: PersistIssue | null; // 最近一次写入核对结果
 }
 
 type Listener = () => void;
@@ -40,6 +52,8 @@ class AppStore {
     settings: DEFAULT_SETTINGS,
     ctx: EMPTY_CTX,
     selected: new Set<string>(),
+    storageMode: 'idb',
+    persistIssue: null,
   };
   private listeners = new Set<Listener>();
   private initPromise: Promise<void> | null = null;
@@ -56,14 +70,44 @@ class AppStore {
     for (const l of this.listeners) l();
   }
 
+  /**
+   * 写入后核对：对比内存预期条数与实际落库条数。
+   * 内存降级模式直接标记 issue（数据根本没存住）；条数对不上说明有写入没落盘。
+   */
+  private async verifyPersist(): Promise<void> {
+    if (this.state.storageMode === 'mem') {
+      this.state.persistIssue = {
+        kind: 'memory',
+        message: '当前环境无法使用本机数据库，数据只保存在内存中，页面刷新或关闭后谜库与登记将全部丢失。',
+        at: Date.now(),
+      };
+      return;
+    }
+    const [rc, cc] = await Promise.all([idb.count(idb.STORE_RIDDLES), idb.count(idb.STORE_RECORDS)]);
+    const er = this.state.riddles.length;
+    const ec = this.state.records.length;
+    if (rc !== er || cc !== ec) {
+      this.state.persistIssue = {
+        kind: 'mismatch',
+        message: `写入核对不符：谜库应存 ${er} 条 / 实存 ${rc} 条，登记应存 ${ec} 条 / 实存 ${cc} 条，部分数据没有存进本机数据库。`,
+        expected: { riddles: er, records: ec },
+        actual: { riddles: rc, records: cc },
+        at: Date.now(),
+      };
+    } else {
+      this.state.persistIssue = null;
+    }
+  }
+
   init(): Promise<void> {
     if (!this.initPromise) {
       this.initPromise = (async () => {
-        const [riddles, records, settings, ctx] = await Promise.all([
+        const [riddles, records, settings, ctx, mode] = await Promise.all([
           idb.getAll<Riddle>(idb.STORE_RIDDLES),
           idb.getAll<OnsiteRecord>(idb.STORE_RECORDS),
           idb.getKV<AppSettings>(KV_SETTINGS),
           loadDataCtx(import.meta.env.BASE_URL),
+          idb.storageMode(),
         ]);
         this.state.riddles = riddles.sort((a, b) => a.no - b.no);
         this.state.records = records.sort((a, b) => b.at - a.at);
@@ -78,6 +122,8 @@ class AppStore {
           this.state.settings.print.hostLine = `${this.state.settings.event.host}`;
         }
         this.state.ctx = ctx;
+        this.state.storageMode = mode;
+        await this.verifyPersist(); // 启动即核对一次，暴露上次没存住的数据
         this.state.ready = true;
         this.emit();
       })();
@@ -111,6 +157,7 @@ class AppStore {
     }
     this.state.riddles.sort((a, b) => a.no - b.no);
     await idb.put(idb.STORE_RIDDLES, riddle);
+    await this.verifyPersist();
     this.emit();
     return riddle;
   }
@@ -130,6 +177,7 @@ class AppStore {
     }));
     this.state.riddles = [...this.state.riddles, ...riddles].sort((a, b) => a.no - b.no);
     await idb.putMany(idb.STORE_RIDDLES, riddles);
+    await this.verifyPersist();
     this.emit();
     return riddles.length;
   }
@@ -142,6 +190,7 @@ class AppStore {
     }));
     this.state.riddles = riddles.sort((a, b) => a.no - b.no);
     await idb.putMany(idb.STORE_RIDDLES, riddles);
+    await this.verifyPersist();
     this.emit();
   }
 
@@ -150,7 +199,8 @@ class AppStore {
     this.state.riddles = this.state.riddles.filter((r) => !set.has(r.id));
     this.state.settings.event.riddleIds = this.state.settings.event.riddleIds.filter((x) => !set.has(x));
     await Promise.all(ids.map((id) => idb.del(idb.STORE_RIDDLES, id)));
-    await this.saveSettings(this.state.settings); // 同步活动清单
+    await this.saveSettings(this.state.settings); // 同步活动清单（saveSettings 内会核对）
+    await this.verifyPersist();
     this.emit();
   }
 
@@ -159,6 +209,7 @@ class AppStore {
     this.state.settings.event.riddleIds = [];
     await idb.clearStore(idb.STORE_RIDDLES);
     await this.saveSettings(this.state.settings);
+    await this.verifyPersist();
     this.emit();
   }
 
@@ -195,6 +246,7 @@ class AppStore {
     const full: OnsiteRecord = { ...rec, id: uid(), at: rec.at ?? Date.now() };
     this.state.records = [full, ...this.state.records];
     await idb.put(idb.STORE_RECORDS, full);
+    await this.verifyPersist();
     this.emit();
     return full;
   }
@@ -202,12 +254,14 @@ class AppStore {
   async removeRecord(id: string): Promise<void> {
     this.state.records = this.state.records.filter((r) => r.id !== id);
     await idb.del(idb.STORE_RECORDS, id);
+    await this.verifyPersist();
     this.emit();
   }
 
   async clearRecords(): Promise<void> {
     this.state.records = [];
     await idb.clearStore(idb.STORE_RECORDS);
+    await this.verifyPersist();
     this.emit();
   }
 
@@ -222,7 +276,10 @@ class AppStore {
         await idb.put(idb.STORE_RECORDS, r);
       }
     }
-    if (n) this.emit();
+    if (n) {
+      await this.verifyPersist();
+      this.emit();
+    }
     return n;
   }
 
@@ -234,7 +291,43 @@ class AppStore {
       prizes: patch.prizes ?? this.state.settings.prizes,
     };
     await idb.setKV(KV_SETTINGS, this.state.settings);
+    await this.verifyPersist();
     this.emit();
+  }
+
+  // ---- 整包备份 / 恢复 ----
+  /**
+   * 执行导入计划：先单事务写库（失败整体回滚、内存不动），成功才更新内存，
+   * 保证「中途失败回到导入前状态」。导入的谜条按当前校验数据重算谜格。
+   */
+  async applyBackup(plan: ImportPlan): Promise<{ ok: boolean; error?: string }> {
+    const now = Date.now();
+    const recheck = (r: Riddle): Riddle => ({
+      ...r,
+      check: { ...validateRiddle(r, this.state.ctx), checkedAt: now },
+    });
+    const planned: ImportPlan = {
+      ...plan,
+      freshRiddles: plan.freshRiddles.map(recheck),
+      overwriteRiddles: plan.overwriteRiddles.map(recheck),
+    };
+    const nextRiddles = mergeRiddles(this.state.riddles, planned);
+    const nextRecords = mergeRecords(this.state.records, planned);
+    const nextSettings = mergeSettings(planned, nextRiddles, this.state.settings);
+    const ok = await idb.restoreAll({
+      riddles: [...planned.overwriteRiddles, ...planned.freshRiddles],
+      records: [...planned.overwriteRecords, ...planned.freshRecords],
+      kv: { key: KV_SETTINGS, value: nextSettings },
+    });
+    if (!ok) {
+      return { ok: false, error: '写入本机数据库失败，已回到导入前状态，原有数据未受影响' };
+    }
+    this.state.riddles = nextRiddles;
+    this.state.records = nextRecords;
+    this.state.settings = nextSettings;
+    await this.verifyPersist();
+    this.emit();
+    return { ok: true };
   }
 
   // ---- 统计 ----
@@ -260,4 +353,11 @@ export function exportFileName(prefix: string, ext: string): string {
   const ev = store.getState().settings.event;
   const base = ev.title ? `${ev.title}-` : '';
   return `${prefix}-${base}${formatDate(new Date())}.${ext}`;
+}
+
+/** 整包备份下载：谜库 + 登记记录 + 设置 → 单个 JSON 文件（含导出时间/条数/来源） */
+export function downloadBackup(): void {
+  const s = store.getState();
+  const backup = buildBackup(s.riddles, s.records, s.settings, s.storageMode === 'mem' ? '内存模式' : 'IndexedDB');
+  downloadText(exportFileName('整包备份', 'json'), JSON.stringify(backup, null, 2), 'application/json;charset=utf-8');
 }

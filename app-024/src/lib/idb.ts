@@ -1,4 +1,6 @@
 // IndexedDB 轻封装（离线优先；无 IndexedDB 环境自动降级为内存存储）
+import type { OnsiteRecord, Riddle } from '../types';
+
 const DB_NAME = 'app-024-lantern-riddle';
 const DB_VERSION = 1;
 export const STORE_RIDDLES = 'riddles';
@@ -101,4 +103,60 @@ export async function getKV<T>(key: string): Promise<T | null> {
 
 export async function setKV<T>(key: string, value: T): Promise<void> {
   await put(STORE_KV, { key, value });
+}
+
+/** 当前存储模式：'idb' 持久化 / 'mem' 内存降级（刷新即丢失）。同一会话内结果稳定。 */
+export async function storageMode(): Promise<'idb' | 'mem'> {
+  return (await openDB()) ? 'idb' : 'mem';
+}
+
+/** 实际存了多少条（写入后核对用）；IndexedDB 不可用时返回内存表条数 */
+export async function count(store: string): Promise<number> {
+  const { ok, result } = await tx<number>(store, 'readonly', (s) => s.count());
+  if (ok && typeof result === 'number') return result;
+  return memStore(store).size;
+}
+
+export interface RestorePayload {
+  riddles: Riddle[];          // upsert 列表（新增 + 覆盖）
+  records: OnsiteRecord[];
+  kv: { key: string; value: unknown };
+}
+
+/**
+ * 整包恢复写库：跨三个 store 的单事务，任一条失败整个事务回滚，
+ * 数据库回到写入前状态（内存降级模式同样先快照、失败恢复）。
+ * 返回是否全部落盘成功。
+ */
+export async function restoreAll(payload: RestorePayload): Promise<boolean> {
+  const db = await openDB();
+  if (!db) {
+    const snaps: [string, Map<string, unknown>][] = [
+      [STORE_RIDDLES, new Map(memStore(STORE_RIDDLES))],
+      [STORE_RECORDS, new Map(memStore(STORE_RECORDS))],
+      [STORE_KV, new Map(memStore(STORE_KV))],
+    ];
+    try {
+      for (const r of payload.riddles) memStore(STORE_RIDDLES).set(r.id, r);
+      for (const r of payload.records) memStore(STORE_RECORDS).set(r.id, r);
+      memStore(STORE_KV).set(payload.kv.key, payload.kv);
+      return true;
+    } catch {
+      for (const [name, snap] of snaps) mem.set(name, snap);
+      return false;
+    }
+  }
+  return new Promise((resolve) => {
+    try {
+      const t = db.transaction([STORE_RIDDLES, STORE_RECORDS, STORE_KV], 'readwrite');
+      const rs = t.objectStore(STORE_RIDDLES);
+      for (const r of payload.riddles) rs.put(r);
+      const cs = t.objectStore(STORE_RECORDS);
+      for (const r of payload.records) cs.put(r);
+      t.objectStore(STORE_KV).put(payload.kv);
+      t.oncomplete = () => resolve(true);
+      t.onerror = () => resolve(false);
+      t.onabort = () => resolve(false);
+    } catch { resolve(false); }
+  });
 }

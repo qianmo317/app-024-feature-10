@@ -3,7 +3,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { useAppState } from '../ui/router';
 import { CATEGORY_LABEL, FORMAT_LABEL } from '../types';
 import { formatDateTime } from '../lib/format';
-import { store } from '../lib/store';
+import { downloadBackup, store } from '../lib/store';
 
 const QUICK_PRIZE_IDX = 0; // 长按快速登记使用第一个奖项
 
@@ -103,6 +103,19 @@ export function Onsite() {
         <div className="stat"><b>{stats.remaining}</b><span>剩余</span></div>
         <div className="stat"><b>{stats.prizes}</b><span>奖品发放</span></div>
       </div>
+
+      {state.persistIssue && (
+        <div className="alert-banner alert-danger" role="alert">
+          <span className="alert-icon" aria-hidden>⚠</span>
+          <div className="alert-body">
+            <b>{state.persistIssue.kind === 'memory' ? '当前登记不会被保存' : '存储核对不符，登记可能丢失'}</b>
+            <p>{state.persistIssue.message} 请先导出整包备份留存，再继续登记。</p>
+          </div>
+          <div className="alert-actions">
+            <button className="btn btn-danger" onClick={downloadBackup}>⬇ 先导出整包备份</button>
+          </div>
+        </div>
+      )}
 
       <div className="onsite-grid">
         <div className="panel">

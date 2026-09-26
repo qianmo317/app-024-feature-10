@@ -270,4 +270,82 @@ test.describe('元宵灯谜库 E2E', () => {
     await expect(page.locator('.stat-ok')).toContainText('3');
     await expect(page.locator('.records-table tbody tr')).toHaveCount(3);
   });
+
+  test('整包备份导出（含导出时间/条数/来源，可往返恢复）', async ({ page }) => {
+    await importSample(page);
+    await page.click('nav >> text=设置');
+    const [download] = await Promise.all([
+      page.waitForEvent('download'),
+      page.click('button:has-text("导出整包备份")'),
+    ]);
+    const path = (await download.path())!;
+    const backup = JSON.parse(readFileSync(path, 'utf8'));
+    expect(backup.kind).toBe('lantern-riddle-backup');
+    expect(backup.counts).toMatchObject({ riddles: TOTAL, records: 0 });
+    expect(backup.exportedAt).toBeTruthy();
+    expect(backup.source.storage).toBe('IndexedDB');
+    expect(backup.data.riddles).toHaveLength(TOTAL);
+    expect(backup.data.settings.event).toBeTruthy();
+
+    // 往返恢复到一个空库：全部应显示为「新增」
+    page.once('dialog', (d) => d.accept());
+    await page.click('button:has-text("清空谜库")');
+    await page.setInputFiles('input[type=file][accept=".json,application/json"]', path);
+    await expect(page.locator('.restore-preview')).toContainText(`新增 ${TOTAL} 条`);
+    await expect(page.locator('.restore-preview')).toContainText('覆盖 0 条');
+    await expect(page.locator('.restore-preview')).toContainText('整体替换');
+    await page.click('button:has-text("确认恢复")');
+    await expect(page.locator('.notice')).toContainText('整包恢复完成');
+    await page.click('nav >> text=谜库');
+    await expect(page.locator('.page-head h1')).toContainText(`${TOTAL} 条`);
+  });
+
+  test('整包恢复预览：覆盖分类 + 取消不写库', async ({ page }) => {
+    await importSample(page);
+    await page.click('nav >> text=设置');
+    const [d1] = await Promise.all([page.waitForEvent('download'), page.click('button:has-text("导出整包备份")')]);
+    const backupPath = (await d1.path())!;
+    // 同一文件对当前库：谜条 id 全部相同 → 全部判为覆盖
+    await page.setInputFiles('input[type=file][accept=".json,application/json"]', backupPath);
+    await expect(page.locator('.restore-preview')).toContainText('新增 0 条');
+    await expect(page.locator('.restore-preview')).toContainText(`覆盖 ${TOTAL} 条`);
+    // 取消导入则不写库
+    await page.click('.restore-preview button:has-text("取消")');
+    await expect(page.locator('.restore-preview')).toHaveCount(0);
+    // 确认恢复 → 提示覆盖条数
+    await page.setInputFiles('input[type=file][accept=".json,application/json"]', backupPath);
+    await page.click('button:has-text("确认恢复")');
+    await expect(page.locator('.notice')).toContainText(`覆盖 ${TOTAL} 条`);
+    await page.click('nav >> text=谜库');
+    await expect(page.locator('.page-head h1')).toContainText(`${TOTAL} 条`);
+  });
+
+  test('非法备份文件给出错误提示而不白屏', async ({ page }) => {
+    await page.goto('/#/settings');
+    await page.setInputFiles('input[type=file][accept=".json,application/json"]', {
+      name: 'bad.json', mimeType: 'application/json', buffer: Buffer.from('{ not json', 'utf8'),
+    });
+    await expect(page.locator('.msg-bad')).toContainText('JSON');
+  });
+
+  test('无 IndexedDB（内存模式）：醒目横幅提示并要求先导出备份', async ({ context }) => {
+    // 在所有页面脚本执行前删除 indexedDB，模拟无本机数据库的环境
+    await context.addInitScript(() => {
+      Object.defineProperty(window, 'indexedDB', { value: undefined, configurable: true });
+    });
+    const page = await context.newPage();
+    await page.goto('/');
+    await expect(page.locator('.badge-danger')).toContainText('内存模式');
+    await expect(page.locator('.alert-danger')).toContainText('数据没有存进本机数据库');
+    await expect(page.locator('.alert-danger')).toContainText('先导出整包备份');
+    await expect(page.locator('button:has-text("立即导出整包备份")')).toBeVisible();
+    await page.setInputFiles('input[type=file]', SAMPLE);
+    await page.click('button:has-text("确认导入")');
+    // 写入后横幅仍在（每次写入核对都会提示数据没存住）
+    await expect(page.locator('.alert-danger')).toBeVisible();
+    await expect(page.locator('.badge-danger')).toContainText('刷新即丢失');
+    // 刷新后数据消失
+    await page.reload();
+    await expect(page.locator('.empty')).toBeVisible();
+  });
 });
